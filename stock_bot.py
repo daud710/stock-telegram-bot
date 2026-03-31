@@ -7,7 +7,6 @@ import os
 import logging
 import asyncio
 import requests
-import json
 from datetime import datetime
 import pytz
 import schedule
@@ -15,7 +14,6 @@ import time
 import threading
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from groq import Groq
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -26,7 +24,6 @@ IST                = pytz.timezone("Asia/Kolkata")
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ── NSE Stock List ─────────────────────────────────────────────────────────────
 NSE_STOCKS = [
@@ -140,16 +137,24 @@ def get_all_stocks() -> list[dict]:
 # ── AI Analysis ───────────────────────────────────────────────────────────────
 def ai_analyze(prompt: str) -> str:
     try:
-        resp = groq_client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=[
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
                 {"role": "system", "content": "Tum ek expert Indian stock market analyst ho. Hindi mein concise jawab do."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=800,
-            temperature=0.7,
+            "max_tokens": 800,
+            "temperature": 0.7,
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=payload, timeout=30
         )
-        return resp.choices[0].message.content
+        return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"AI analysis unavailable: {e}"
 
