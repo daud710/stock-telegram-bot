@@ -22,6 +22,8 @@ import feedparser
 import yfinance as yf
 import pytz
 import requests
+import sys
+sys.setrecursionlimit(10000)
 from datetime import datetime, timedelta
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
