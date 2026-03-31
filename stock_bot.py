@@ -85,6 +85,20 @@ GAINERS:
 STOCKNAME: reason here
 LOSERS:
 STOCKNAME: reason here"""
+def get_stock_data():
+    results = []
+    for name, ticker in NSE_STOCKS.items():
+        try:
+            stock = yf.Ticker(ticker)
+            hist  = stock.history(period="5d")
+            if len(hist) >= 2:
+                prev = hist["Close"].iloc[-2]
+                curr = hist["Close"].iloc[-1]
+                chg  = ((curr - prev) / prev) * 100
+                results.append({"name": name, "ticker": ticker, "price": round(curr, 2), "change": round(chg, 2)})
+        except:
+            pass
+    return results
 
     try:
         headers = {
