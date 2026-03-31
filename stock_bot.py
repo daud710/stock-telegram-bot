@@ -99,17 +99,17 @@ def fetch_nse_quote(symbol: str, session) -> dict | None:
         logger.warning(f"NSE quote failed {symbol}: {e}")
         return None
 
-def fetch_nse_history(symbol: str, session) -> list[float]:
-    """Fetch 3-month price history from NSE."""
+def fetch_nse_history(symbol: str, session=None) -> list:
+    """Fetch price history using yfinance (historical only, live from NSE)."""
     try:
-        url = f"https://www.nseindia.com/api/historical/cm/equity?symbol={symbol.upper()}&series=[%22EQ%22]&from=2024-01-01&to=2025-12-31"
-        r = session.get(url, timeout=15)
-        if r.status_code != 200:
+        import yfinance as yf
+        ticker = yf.Ticker(f"{symbol.upper()}.NS")
+        hist = ticker.history(period="3mo")
+        if hist.empty:
             return []
-        data = r.json().get("data", [])
-        closes = [float(row["CH_CLOSING_PRICE"]) for row in data if row.get("CH_CLOSING_PRICE")]
-        return closes[-65:]  # last ~3 months
-    except:
+        return [round(float(p), 2) for p in hist["Close"].tolist()]
+    except Exception as e:
+        logger.warning(f"History fetch failed {symbol}: {e}")
         return []
 
 def fetch_all_stocks_nse() -> list[dict]:
