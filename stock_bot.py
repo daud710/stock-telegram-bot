@@ -1,387 +1,291 @@
 """
-🤖 Indian Stock Market Telegram Bot — FAST VERSION (Groq)
+🤖 Indian Stock Market Telegram Bot — FIXED VERSION
+Uses NSE Unofficial API (24/7) + yfinance as fallback
 """
 
-import asyncio
-import logging
 import os
+import logging
+import asyncio
+import requests
+import json
+from datetime import datetime
+import pytz
 import schedule
 import time
 import threading
-import feedparser
-import yfinance as yf
-import pytz
-import requests
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from groq import Groq
 
-sys.setrecursionlimit(10000)
-
+# ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
+IST                = pytz.timezone("Asia/Kolkata")
 
-IST = pytz.timezone("Asia/Kolkata")
-
-NSE_STOCKS = {
-    "RELIANCE": "RELIANCE.NS", "TCS": "TCS.NS", "HDFCBANK": "HDFCBANK.NS",
-    "INFY": "INFY.NS", "ICICIBANK": "ICICIBANK.NS", "HINDUNILVR": "HINDUNILVR.NS",
-    "SBIN": "SBIN.NS", "BAJFINANCE": "BAJFINANCE.NS", "KOTAKBANK": "KOTAKBANK.NS",
-    "AXISBANK": "AXISBANK.NS", "ITC": "ITC.NS", "MARUTI": "MARUTI.NS",
-    "WIPRO": "WIPRO.NS", "ULTRACEMCO": "ULTRACEMCO.NS", "TITAN": "TITAN.NS",
-    "SUNPHARMA": "SUNPHARMA.NS", "ONGC": "ONGC.NS", "NTPC": "NTPC.NS",
-    "POWERGRID": "POWERGRID.NS", "TATAMOTORS": "TATAMOTORS.NS", "LT": "LT.NS",
-    "ASIANPAINT": "ASIANPAINT.NS", "ADANIPORTS": "ADANIPORTS.NS",
-    "HCLTECH": "HCLTECH.NS", "NESTLEIND": "NESTLEIND.NS", "BAJAJFINSV": "BAJAJFINSV.NS",
-    "DIVISLAB": "DIVISLAB.NS", "DRREDDY": "DRREDDY.NS", "EICHERMOT": "EICHERMOT.NS",
-    "GRASIM": "GRASIM.NS", "HEROMOTOCO": "HEROMOTOCO.NS", "HINDALCO": "HINDALCO.NS",
-    "JSWSTEEL": "JSWSTEEL.NS", "SBILIFE": "SBILIFE.NS",
-    "TATACONSUM": "TATACONSUM.NS", "TATASTEEL": "TATASTEEL.NS", "TECHM": "TECHM.NS",
-    "COALINDIA": "COALINDIA.NS", "BPCL": "BPCL.NS",
-}
-
-NEWS_FEEDS = [
-    "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-    "https://www.moneycontrol.com/rss/MCtopnews.xml",
-    "https://feeds.feedburner.com/ndtvprofit-latest",
-]
-
-seen_news = set()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def ai_analyze(gainers, losers):
-    gainer_str = ", ".join([f"{g['name']} ({g['change']:+.1f}%)" for g in gainers])
-    loser_str  = ", ".join([f"{l['name']} ({l['change']:+.1f}%)" for l in losers])
-    prompt = f"""Indian stock market movers today:
-GAINERS: {gainer_str}
-LOSERS: {loser_str}
-For each stock write ONE short simple reason (5-8 words max). Indian market context. Realistic.
-Format:
-GAINERS:
-STOCKNAME: reason here
-LOSERS:
-STOCKNAME: reason here"""
-    try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}], "max_tokens": 600, "temperature": 0.7}
-        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"Groq AI error: {e}")
-        return ""
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-def make_bar_chart(prices, width=24):
-    if not prices or len(prices) < 2:
-        return "No data"
-    sample = prices[-width:]
-    mn, mx = min(sample), max(sample)
-    rng = mx - mn if mx != mn else 1
-    bars = "▁▂▃▄▅▆▇█"
-    return "".join(bars[min(int(((p - mn) / rng) * 7), 7)] for p in sample)
+# ── NSE Stock List ─────────────────────────────────────────────────────────────
+NSE_STOCKS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "HINDUNILVR", "SBIN", "BHARTIARTL", "ITC", "KOTAKBANK",
+    "LT", "AXISBANK", "ASIANPAINT", "MARUTI", "SUNPHARMA",
+    "WIPRO", "ULTRACEMCO", "TITAN", "BAJFINANCE", "NESTLEIND",
+    "TECHM", "POWERGRID", "HCLTECH", "NTPC", "ONGC",
+    "TATAMOTORS", "TATASTEEL", "JSWSTEEL", "COALINDIA", "ADANIENT"
+]
 
-def fetch_single_stock(name, ticker):
+# ── NSE Data Fetcher (Primary - works 24/7) ───────────────────────────────────
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+}
+
+def get_nse_session():
+    """Get NSE session with cookies."""
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="5d")
-        if len(hist) >= 2:
-            prev = hist["Close"].iloc[-2]
-            curr = hist["Close"].iloc[-1]
-            chg  = ((curr - prev) / prev) * 100
-            return {"name": name, "ticker": ticker, "price": round(curr, 2), "change": round(chg, 2)}
+        s.get("https://www.nseindia.com", timeout=10)
+        s.get("https://www.nseindia.com/market-data/live-equity-market", timeout=10)
     except:
         pass
-    return None
+    return s
 
-def get_stock_data():
-    results = []
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(fetch_single_stock, name, ticker): name for name, ticker in NSE_STOCKS.items()}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                results.append(result)
-    return results
-
-def get_stock_history(symbol, period="3mo"):
-    ticker_name = NSE_STOCKS.get(symbol.upper(), symbol.upper() + ".NS")
+def fetch_stock_nse(symbol: str, session=None) -> dict | None:
+    """Fetch stock data from NSE API."""
     try:
-        stock = yf.Ticker(ticker_name)
-        info = stock.info
-        hist_1w = stock.history(period="5d")
-        hist_1m = stock.history(period="1mo")
-        hist_3m = stock.history(period="3mo")
-        hist_6m = stock.history(period="6mo")
-        hist_1y = stock.history(period="1y")
-        if hist_1m.empty:
+        if session is None:
+            session = get_nse_session()
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+        resp = session.get(url, timeout=10)
+        if resp.status_code != 200:
             return None
-        curr_price = round(hist_1m["Close"].iloc[-1], 2)
-        prev_price = round(hist_1m["Close"].iloc[-2], 2) if len(hist_1m) >= 2 else curr_price
-        today_chg  = round(((curr_price - prev_price) / prev_price) * 100, 2)
-        curr_vol = int(hist_1m["Volume"].iloc[-1]) if "Volume" in hist_1m else 0
-        avg_vol  = int(hist_1m["Volume"].mean()) if "Volume" in hist_1m else 0
-        high_52w = round(hist_1y["High"].max(), 2) if not hist_1y.empty else "N/A"
-        low_52w  = round(hist_1y["Low"].min(), 2)  if not hist_1y.empty else "N/A"
-        price_1w = round(hist_1w["Close"].iloc[0], 2) if not hist_1w.empty else curr_price
-        price_1m = round(hist_1m["Close"].iloc[0], 2) if not hist_1m.empty else curr_price
-        price_3m = round(hist_3m["Close"].iloc[0], 2) if not hist_3m.empty else curr_price
-        price_6m = round(hist_6m["Close"].iloc[0], 2) if not hist_6m.empty else curr_price
-        price_1y = round(hist_1y["Close"].iloc[0], 2) if not hist_1y.empty else curr_price
-        ret_1w = round(((curr_price - price_1w) / price_1w) * 100, 2)
-        ret_1m = round(((curr_price - price_1m) / price_1m) * 100, 2)
-        ret_3m = round(((curr_price - price_3m) / price_3m) * 100, 2)
-        ret_6m = round(((curr_price - price_6m) / price_6m) * 100, 2)
-        ret_1y = round(((curr_price - price_1y) / price_1y) * 100, 2)
-        support    = round(hist_1m["Low"].min(), 2)
-        resistance = round(hist_1m["High"].max(), 2)
-        closes = hist_3m["Close"].tolist() if not hist_3m.empty else []
-        ma20 = round(sum(closes[-20:]) / min(20, len(closes)), 2) if closes else "N/A"
-        ma50 = round(sum(closes[-50:]) / min(50, len(closes)), 2) if len(closes) >= 10 else "N/A"
-        signal = "NEUTRAL"
-        signal_reason = "Market average trend"
-        if isinstance(ma20, float) and curr_price > ma20:
-            signal, signal_reason = "BULLISH", "Price is above 20-day average"
-        elif isinstance(ma20, float) and curr_price < ma20:
-            signal, signal_reason = "BEARISH", "Price is below 20-day average"
-        if isinstance(high_52w, float) and curr_price >= high_52w * 0.97:
-            signal, signal_reason = "STRONG BULLISH", "Near 52-week high — strong momentum"
-        elif isinstance(low_52w, float) and curr_price <= low_52w * 1.03:
-            signal, signal_reason = "OVERSOLD", "Near 52-week low — possible bounce"
-        pos_52w = round(((curr_price - low_52w) / (high_52w - low_52w)) * 100, 1) if isinstance(high_52w, float) and isinstance(low_52w, float) else "N/A"
-        vol_status = "High Volume" if curr_vol > avg_vol * 1.3 else "Low Volume" if curr_vol < avg_vol * 0.7 else "Normal Volume"
-        bar_chart = make_bar_chart(hist_3m["Close"].tolist() if not hist_3m.empty else [], width=30)
-        name   = info.get("longName", symbol)
-        sector = info.get("sector", "N/A")
-        mktcap = info.get("marketCap", 0)
-        pe  = info.get("trailingPE", None)
-        pb  = info.get("priceToBook", None)
-        div = info.get("dividendYield", None)
+        data = resp.json()
+        pd = data.get("priceInfo", {})
+        price = pd.get("lastPrice", 0)
+        prev  = pd.get("previousClose", 0)
+        change_pct = pd.get("pChange", 0)
+        week52 = data.get("priceInfo", {}).get("weekHighLow", {})
         return {
-            "symbol": symbol.upper(), "name": name, "sector": sector,
-            "curr_price": curr_price, "prev_price": prev_price, "today_chg": today_chg,
-            "ret_1w": ret_1w, "ret_1m": ret_1m, "ret_3m": ret_3m, "ret_6m": ret_6m, "ret_1y": ret_1y,
-            "high_52w": high_52w, "low_52w": low_52w, "pos_52w": pos_52w,
-            "support": support, "resistance": resistance, "ma20": ma20, "ma50": ma50,
-            "signal": signal, "signal_reason": signal_reason,
-            "curr_vol": curr_vol, "avg_vol": avg_vol, "vol_status": vol_status,
-            "mktcap": f"₹{round(mktcap/1e9, 1)}B" if mktcap else "N/A",
-            "pe": round(pe, 1) if pe else "N/A",
-            "pb": round(pb, 2) if pb else "N/A",
-            "div": f"{round(div*100, 2)}%" if div else "N/A",
-            "bar_chart": bar_chart,
+            "symbol": symbol,
+            "price": price,
+            "prev_close": prev,
+            "change_pct": round(change_pct, 2),
+            "week_high": week52.get("max", 0),
+            "week_low": week52.get("min", 0),
+            "volume": data.get("marketDeptOrderBook", {}).get("tradeInfo", {}).get("totalTradedVolume", 0),
         }
     except Exception as e:
-        logger.error(f"History fetch error for {symbol}: {e}")
+        logger.warning(f"NSE fetch failed for {symbol}: {e}")
         return None
 
-def format_stock_detail(d):
-    sig_emoji = {"BULLISH": "🟢", "STRONG BULLISH": "🚀", "BEARISH": "🔴", "OVERSOLD": "⚡", "NEUTRAL": "🟡"}.get(d["signal"], "🟡")
-    chg_emoji = "📈" if d["today_chg"] > 0 else "📉"
-    def ret_str(v):
-        return f"{'▲' if v > 0 else '▼'} {abs(v):.1f}%"
-    bar52 = ("█" * int(d["pos_52w"] / 10) + "░" * (10 - int(d["pos_52w"] / 10)) + f" {d['pos_52w']}%") if isinstance(d["pos_52w"], float) else "N/A"
-    msg  = f"📊 *{d['name']}*\n`{d['symbol']}` | {d['sector']}\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"💰 *Current Price:*  `₹{d['curr_price']}`\n"
-    msg += f"{chg_emoji} *Aaj ka Change:*  `{d['today_chg']:+.2f}%`\n\n"
-    msg += f"📉📈 *3 Month Price Chart:*\n`{d['bar_chart']}`\n_Low → High_\n\n"
-    msg += "📅 *Performance:*\n```\n"
-    msg += f"1W: {ret_str(d['ret_1w'])}  1M: {ret_str(d['ret_1m'])}\n"
-    msg += f"3M: {ret_str(d['ret_3m'])}  6M: {ret_str(d['ret_6m'])}\n"
-    msg += f"1Y: {ret_str(d['ret_1y'])}\n```\n\n"
-    msg += f"📌 *52W:* Low `₹{d['low_52w']}` — High `₹{d['high_52w']}`\n`[{bar52}]`\n\n"
-    msg += f"🎯 Support `₹{d['support']}` | Resistance `₹{d['resistance']}`\n"
-    msg += f"📐 MA20: `₹{d['ma20']}` | MA50: `₹{d['ma50']}`\n\n"
-    vol_bar = "🔊" if d["vol_status"] == "High Volume" else "🔉" if d["vol_status"] == "Normal Volume" else "🔈"
-    msg += f"{vol_bar} {d['vol_status']}"
-    if d["curr_vol"]:
-        msg += f" | Today: `{d['curr_vol']:,}`\n\n"
-    msg += f"🏦 Cap: `{d['mktcap']}` | P/E: `{d['pe']}` | Div: `{d['div']}`\n\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n{sig_emoji} *{d['signal']}* — _{d['signal_reason']}_\n\n"
-    msg += "⚠️ _Sirf information. Apna research karo._"
-    return msg
-
-def format_briefing(gainers, losers, reasons):
-    now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
-    msg  = f"🌅 *GOOD MORNING — Daily Market Briefing*\n📅 {now}\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📈 *TOP 10 GAINERS*\n\n"
-    for i, s in enumerate(gainers, 1):
-        reason = reasons.get(s["name"].upper(), "Strong buying interest")
-        msg += f"🟢 *{i}. {s['name']}*  `{s['change']:+.2f}%`\n   ₹{s['price']}  |  _{reason}_\n\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📉 *TOP 10 LOSERS*\n\n"
-    for i, s in enumerate(losers, 1):
-        reason = reasons.get(s["name"].upper(), "Selling pressure today")
-        msg += f"🔴 *{i}. {s['name']}*  `{s['change']:+.2f}%`\n   ₹{s['price']}  |  _{reason}_\n\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n💡 _Kisi bhi stock naam bhejo — history milegi!_\n⚠️ _Sirf information. Investment advice nahi._"
-    return msg
-
-def format_news_alert(title, summary, source):
-    msg  = "📰 *MARKET NEWS ALERT*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"📌 *{title}*\n\n"
-    if summary:
-        clean = summary[:280].replace("<b>","").replace("</b>","").replace("<br>","").replace("&amp;","&")
-        msg += f"_{clean}_\n\n"
-    msg += f"🔗 _Source: {source}_\n━━━━━━━━━━━━━━━━━━━━━━━━"
-    return msg
-
-def get_top_movers(data, n=10):
-    return sorted(data, key=lambda x: x["change"], reverse=True)[:n], sorted(data, key=lambda x: x["change"])[:n]
-
-def parse_ai_reasons(ai_text):
-    reasons = {}
-    for line in ai_text.splitlines():
-        line = line.strip()
-        if ":" in line and not line.upper().startswith(("GAINER","LOSER")):
-            parts = line.split(":", 1)
-            if len(parts) == 2:
-                reasons[parts[0].strip().upper()] = parts[1].strip()
-    return reasons
-
-def fetch_latest_news(max_items=5):
-    articles = []
-    for url in NEWS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                article = {"title": entry.get("title",""), "summary": entry.get("summary",""), "link": entry.get("link",""), "id": entry.get("id", entry.get("link","")), "source": feed.feed.get("title","News")}
-                if article["id"] and article["id"] not in seen_news:
-                    articles.append(article)
-        except:
-            pass
-    return articles[:max_items]
-
-async def send_morning_briefing(bot: Bot):
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⏳ _Subah ki briefing aa rahi hai..._", parse_mode=ParseMode.MARKDOWN)
+def fetch_stock_yfinance(symbol: str) -> dict | None:
+    """Fallback: fetch from yfinance."""
     try:
-        data = get_stock_data()
-        if not data:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❌ Market data unavailable.")
-            return
-        gainers, losers = get_top_movers(data)
-        reasons = parse_ai_reasons(ai_analyze(gainers, losers))
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_briefing(gainers, losers, reasons), parse_mode=ParseMode.MARKDOWN)
+        import yfinance as yf
+        t = yf.Ticker(f"{symbol}.NS")
+        hist = t.history(period="5d")
+        if len(hist) < 2:
+            return None
+        curr = hist["Close"].iloc[-1]
+        prev = hist["Close"].iloc[-2]
+        chg  = ((curr - prev) / prev) * 100
+        info = t.fast_info
+        return {
+            "symbol": symbol,
+            "price": round(float(curr), 2),
+            "prev_close": round(float(prev), 2),
+            "change_pct": round(chg, 2),
+            "week_high": getattr(info, "year_high", 0) or 0,
+            "week_low":  getattr(info, "year_low", 0) or 0,
+            "volume": 0,
+        }
     except Exception as e:
-        logger.error(f"Briefing error: {e}")
+        logger.warning(f"yfinance failed for {symbol}: {e}")
+        return None
 
-async def send_news_alerts(bot: Bot):
-    global seen_news
-    for article in fetch_latest_news():
-        if article["id"] not in seen_news:
-            seen_news.add(article["id"])
-            try:
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_news_alert(article["title"], article["summary"], article["source"]), parse_mode=ParseMode.MARKDOWN)
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"News error: {e}")
+def get_single_stock(symbol: str) -> dict | None:
+    """Get stock — try NSE first, then yfinance."""
+    session = get_nse_session()
+    data = fetch_stock_nse(symbol.upper(), session)
+    if data and data["price"] > 0:
+        return data
+    return fetch_stock_yfinance(symbol.upper())
 
+def get_all_stocks() -> list[dict]:
+    """Fetch all stocks in parallel using threading."""
+    results = []
+    lock = threading.Lock()
+    session = get_nse_session()
+
+    def fetch(sym):
+        d = fetch_stock_nse(sym, session)
+        if not d or d["price"] == 0:
+            d = fetch_stock_yfinance(sym)
+        if d and d["price"] > 0:
+            with lock:
+                results.append(d)
+
+    threads = [threading.Thread(target=fetch, args=(s,)) for s in NSE_STOCKS]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    return results
+
+# ── AI Analysis ───────────────────────────────────────────────────────────────
+def ai_analyze(prompt: str) -> str:
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {"role": "system", "content": "Tum ek expert Indian stock market analyst ho. Hindi mein concise jawab do."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=800,
+            temperature=0.7,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"AI analysis unavailable: {e}"
+
+# ── Briefing ──────────────────────────────────────────────────────────────────
+def format_stock_row(d: dict, rank: int) -> str:
+    arrow = "🟢" if d["change_pct"] >= 0 else "🔴"
+    return f"{rank}. {arrow} *{d['symbol']}* ₹{d['price']:,.2f} ({d['change_pct']:+.2f}%)"
+
+def build_briefing() -> str:
+    stocks = get_all_stocks()
+    if not stocks:
+        return "❌ Data fetch nahi hua. NSE server se response nahi mila. Thodi der baad try karo."
+
+    stocks.sort(key=lambda x: x["change_pct"])
+    top_losers  = stocks[:10]
+    top_gainers = list(reversed(stocks[-10:]))
+
+    now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    msg = f"📊 *Stock Market Briefing*\n_{now}_\n\n"
+
+    msg += "🔴 *Top 10 Girawat (Losers)*\n"
+    for i, s in enumerate(top_losers, 1):
+        msg += format_stock_row(s, i) + "\n"
+
+    msg += "\n🟢 *Top 10 Uchhai (Gainers)*\n"
+    for i, s in enumerate(top_gainers, 1):
+        msg += format_stock_row(s, i) + "\n"
+
+    # AI prediction
+    summary = ", ".join([f"{s['symbol']} {s['change_pct']:+.1f}%" for s in stocks])
+    prediction = ai_analyze(
+        f"Aaj ke NSE data ke basis pe: {summary}\n"
+        "Kal ke top 5 gainers aur top 5 losers predict karo — short mein."
+    )
+    msg += f"\n🤖 *AI Prediction (Kal ke liye)*\n{prediction}"
+    return msg
+
+# ── /stock command ─────────────────────────────────────────────────────────────
+def build_stock_detail(symbol: str) -> str:
+    d = get_single_stock(symbol)
+    if not d:
+        return f"❌ *{symbol}* ka data nahi mila.\n\nValid stocks: RELIANCE, TCS, HDFCBANK, INFY, SBIN"
+
+    arrow = "🟢" if d["change_pct"] >= 0 else "🔴"
+    msg  = f"{arrow} *{d['symbol']}* — Live Data\n"
+    msg += f"💰 Price: ₹{d['price']:,.2f}\n"
+    msg += f"📊 Change: {d['change_pct']:+.2f}%\n"
+    msg += f"⬅️ Prev Close: ₹{d['prev_close']:,.2f}\n"
+    if d.get("week_high"):
+        msg += f"📈 52W High: ₹{d['week_high']:,.2f}\n"
+        msg += f"📉 52W Low:  ₹{d['week_low']:,.2f}\n"
+    if d.get("volume"):
+        msg += f"📦 Volume: {int(d['volume']):,}\n"
+
+    analysis = ai_analyze(
+        f"{symbol} stock: Price ₹{d['price']}, Change {d['change_pct']:+.2f}%, "
+        f"52W High ₹{d['week_high']}, 52W Low ₹{d['week_low']}. "
+        "Short buy/sell/hold recommendation do."
+    )
+    msg += f"\n🤖 *AI Recommendation:*\n{analysis}"
+    return msg
+
+# ── Telegram Handlers ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = ("🤖 *Indian Stock Market Bot!*\n\n📋 *Commands:*\n• /briefing — Top gainers & losers\n• /news — Latest news\n• /stock RELIANCE — Stock history\n• /help — All commands\n\n💡 Shortcut: Bas naam bhejo — `RELIANCE` ya `TCS`\n⏰ Auto 8 AM briefing + 30 min news\n⚠️ _Investment advice nahi._")
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🤖 *Indian Stock Bot — Active!*\n\n"
+        "Commands:\n"
+        "/briefing — Top gainers & losers + AI prediction\n"
+        "/stock RELIANCE — Kisi bhi stock ka detail\n"
+        "/help — Help\n\n"
+        "Ya seedha stock naam type karo: `HDFCBANK`",
+        parse_mode="Markdown",
+    )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    stocks_list = ", ".join(list(NSE_STOCKS.keys())[:20]) + "..."
-    msg = (f"📖 *Sab Commands*\n\n/start — Welcome\n/briefing — Top 10 gainers & losers\n/news — Latest market news\n/stock \\[NAME\\] — Stock history\n/help — Ye message\n\n💡 Direct naam: `{stocks_list}`\n\n⏰ Auto: *8:00 AM IST* | News: *Har 30 min*")
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "📖 *Commands:*\n\n"
+        "/briefing — Top 10 gainers & losers\n"
+        "/stock SYMBOL — Stock detail (e.g. /stock TCS)\n\n"
+        "*Available stocks:*\n"
+        "RELIANCE, TCS, HDFCBANK, INFY, ICICIBANK, SBIN,\n"
+        "BHARTIARTL, ITC, KOTAKBANK, LT, AXISBANK,\n"
+        "MARUTI, SUNPHARMA, WIPRO, TATAMOTORS, BAJFINANCE...",
+        parse_mode="Markdown",
+    )
 
 async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ _Data fetch ho raha hai..._", parse_mode=ParseMode.MARKDOWN)
-    try:
-        data = get_stock_data()
-        if not data:
-            await update.message.reply_text("❌ Data nahi mila. Try again.")
-            return
-        gainers, losers = get_top_movers(data)
-        reasons = parse_ai_reasons(ai_analyze(gainers, losers))
-        await update.message.reply_text(format_briefing(gainers, losers, reasons), parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📡 _Latest news aa rahi hai..._", parse_mode=ParseMode.MARKDOWN)
-    articles = fetch_latest_news(max_items=5)
-    if not articles:
-        await update.message.reply_text("Abhi koi naya news nahi.")
-        return
-    for article in articles:
-        try:
-            await update.message.reply_text(format_news_alert(article["title"], article["summary"], article["source"]), parse_mode=ParseMode.MARKDOWN)
-            await asyncio.sleep(1)
-        except:
-            await update.message.reply_text(f"📰 {article['title']}")
-
-async def send_stock_detail(msg_obj, symbol):
-    wait_msg = await msg_obj.reply_text(f"🔍 _{symbol} data fetch ho raha hai..._", parse_mode=ParseMode.MARKDOWN)
-    try:
-        d = get_stock_history(symbol)
-        if not d:
-            await wait_msg.edit_text(f"❌ `{symbol}` ka data nahi mila. Try: RELIANCE, TCS, HDFCBANK")
-            return
-        keyboard = [[InlineKeyboardButton("📅 1W", callback_data=f"hist_{symbol}_1wk"), InlineKeyboardButton("📅 1M", callback_data=f"hist_{symbol}_1mo"), InlineKeyboardButton("📅 3M", callback_data=f"hist_{symbol}_3mo")],[InlineKeyboardButton("📅 6M", callback_data=f"hist_{symbol}_6mo"), InlineKeyboardButton("📅 1Y", callback_data=f"hist_{symbol}_1y"), InlineKeyboardButton("🔄 Refresh", callback_data=f"hist_{symbol}_3mo")]]
-        await wait_msg.delete()
-        await msg_obj.reply_text(format_stock_detail(d), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        await wait_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+    msg = await update.message.reply_text("⏳ Data fetch ho raha hai... 15-20 sec wait karo.")
+    text = build_briefing()
+    await msg.edit_text(text, parse_mode="Markdown")
 
 async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Usage: /stock SYMBOL\nExample: /stock RELIANCE")
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Usage: /stock RELIANCE\nYa seedha type karo: RELIANCE")
         return
-    await send_stock_detail(update.message, ctx.args[0].upper())
+    symbol = args[0].upper()
+    msg = await update.message.reply_text(f"⏳ {symbol} ka data fetch ho raha hai...")
+    text = build_stock_detail(symbol)
+    await msg.edit_text(text, parse_mode="Markdown")
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().upper().replace(" ", "")
-    if text in NSE_STOCKS or (2 <= len(text) <= 15 and text.isalpha()):
-        await send_stock_detail(update.message, text)
-    else:
-        await update.message.reply_text("Stock naam bhejo: `RELIANCE` ya `TCS`\nYa /help karo.", parse_mode=ParseMode.MARKDOWN)
+    text = update.message.text.strip().upper()
+    if text in NSE_STOCKS or len(text) <= 12:
+        msg = await update.message.reply_text(f"⏳ {text} ka data fetch ho raha hai...")
+        result = build_stock_detail(text)
+        await msg.edit_text(result, parse_mode="Markdown")
 
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split("_")
-    if len(parts) < 3 or parts[0] != "hist":
-        return
-    symbol, period = parts[1], parts[2]
-    await query.edit_message_text(f"🔄 _{symbol} loading..._", parse_mode=ParseMode.MARKDOWN)
-    try:
-        d = get_stock_history(symbol, period)
-        if not d:
-            await query.edit_message_text(f"❌ Data nahi mila.")
-            return
-        keyboard = [[InlineKeyboardButton("📅 1W", callback_data=f"hist_{symbol}_1wk"), InlineKeyboardButton("📅 1M", callback_data=f"hist_{symbol}_1mo"), InlineKeyboardButton("📅 3M", callback_data=f"hist_{symbol}_3mo")],[InlineKeyboardButton("📅 6M", callback_data=f"hist_{symbol}_6mo"), InlineKeyboardButton("📅 1Y", callback_data=f"hist_{symbol}_1y"), InlineKeyboardButton("🔄 Refresh", callback_data=f"hist_{symbol}_3mo")]]
-        await query.edit_message_text(format_stock_detail(d), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {str(e)[:100]}")
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+def send_scheduled(app):
+    async def _send():
+        text = build_briefing()
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
+    asyncio.run_coroutine_threadsafe(_send(), app.loop)
 
-def run_scheduler(bot: Bot, loop):
-    schedule.every().day.at("08:00").do(lambda: asyncio.run_coroutine_threadsafe(send_morning_briefing(bot), loop))
-    schedule.every(30).minutes.do(lambda: asyncio.run_coroutine_threadsafe(send_news_alerts(bot), loop))
-    logger.info("✅ Scheduler ready: 8AM briefing + 30min news")
+def run_scheduler(app):
+    schedule.every().day.at("08:00").do(send_scheduled, app)
     while True:
         schedule.run_pending()
         time.sleep(30)
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN set karo!")
-        return
     logger.info("🚀 Bot start ho raha hai...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("briefing", cmd_briefing))
-    app.add_handler(CommandHandler("news",     cmd_news))
     app.add_handler(CommandHandler("stock",    cmd_stock))
-    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    loop = asyncio.get_event_loop()
-    threading.Thread(target=run_scheduler, args=(app.bot, loop), daemon=True).start()
-    logger.info("✅ Bot chal raha hai!")
-    app.run_polling(allowed_updates=["message", "callback_query"])
+
+    sched_thread = threading.Thread(target=run_scheduler, args=(app,), daemon=True)
+    sched_thread.start()
+
+    logger.info("✅ Bot chal raha hai! Scheduler: 8AM briefing")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
