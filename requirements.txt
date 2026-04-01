@@ -3,4 +3,3 @@ schedule==1.2.1
 feedparser==6.0.11
 pytz==2024.1
 requests==2.31.0
-yfinance==0.2.36
