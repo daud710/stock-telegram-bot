@@ -100,16 +100,34 @@ def fetch_nse_quote(symbol: str, session) -> dict | None:
         return None
 
 def fetch_nse_history(symbol: str, session=None) -> list:
-    """Fetch price history using yfinance (historical only, live from NSE)."""
+    """Fetch 3-month price history from NSE historical API — works 24/7."""
     try:
-        import yfinance as yf
-        ticker = yf.Ticker(f"{symbol.upper()}.NS")
-        hist = ticker.history(period="3mo")
-        if hist.empty:
+        if session is None:
+            session = get_nse_session()
+        from datetime import timedelta
+        end = datetime.now(IST)
+        start = end - timedelta(days=120)
+        start_str = start.strftime("%d-%m-%Y")
+        end_str   = end.strftime("%d-%m-%Y")
+        url = (
+            f"https://www.nseindia.com/api/historical/cm/equity"
+            f"?symbol={symbol.upper()}&series=[%22EQ%22]"
+            f"&from={start_str}&to={end_str}"
+        )
+        r = session.get(url, timeout=15)
+        if r.status_code != 200:
             return []
-        return [round(float(p), 2) for p in hist["Close"].tolist()]
+        data = r.json().get("data", [])
+        # data is newest first — reverse it
+        closes = []
+        for row in reversed(data):
+            try:
+                closes.append(round(float(row.get("CH_CLOSING_PRICE", 0)), 2))
+            except:
+                pass
+        return closes[-65:]  # last ~3 months trading days
     except Exception as e:
-        logger.warning(f"History fetch failed {symbol}: {e}")
+        logger.warning(f"NSE history failed {symbol}: {e}")
         return []
 
 def fetch_all_stocks_nse() -> list[dict]:
@@ -304,18 +322,33 @@ def format_stock_detail(d: dict) -> str:
     msg += "⚠️ _Sirf information. Apna research karo._"
     return msg
 
+def build_briefing_keyboard(gainers, losers):
+    """Build inline keyboard with all stocks as clickable buttons."""
+    rows = []
+    # Gainers buttons (3 per row)
+    syms_g = [s["symbol"] for s in gainers]
+    for i in range(0, len(syms_g), 3):
+        rows.append([InlineKeyboardButton(f"🟢 {s}", callback_data=f"stock_{s}") for s in syms_g[i:i+3]])
+    # Losers buttons (3 per row)
+    syms_l = [s["symbol"] for s in losers]
+    for i in range(0, len(syms_l), 3):
+        rows.append([InlineKeyboardButton(f"🔴 {s}", callback_data=f"stock_{s}") for s in syms_l[i:i+3]])
+    return InlineKeyboardMarkup(rows)
+
 def format_briefing(gainers, losers, reasons) -> str:
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
     msg  = f"🌅 *GOOD MORNING — Daily Market Briefing*\n📅 {now}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📈 *TOP 10 GAINERS*\n\n"
     for i, s in enumerate(gainers, 1):
-        reason = reasons.get(s["symbol"].upper(), "Strong buying interest")
-        msg += f"🟢 *{i}. {s['symbol']}*  `{s['change_pct']:+.2f}%`\n   ₹{s['price']}  |  _{reason}_\n\n"
+        reason = reasons.get(s["symbol"].upper(), "")
+        reason_text = f"  |  _{reason}_" if reason else ""
+        msg += f"🟢 *{i}. {s['symbol']}*  `{s['change_pct']:+.2f}%`\n   ₹{s['price']}{reason_text}\n\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📉 *TOP 10 LOSERS*\n\n"
     for i, s in enumerate(losers, 1):
-        reason = reasons.get(s["symbol"].upper(), "Selling pressure today")
-        msg += f"🔴 *{i}. {s['symbol']}*  `{s['change_pct']:+.2f}%`\n   ₹{s['price']}  |  _{reason}_\n\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n💡 _Kisi bhi stock naam bhejo — detail milegi!_\n⚠️ _Sirf information. Investment advice nahi._"
+        reason = reasons.get(s["symbol"].upper(), "")
+        reason_text = f"  |  _{reason}_" if reason else ""
+        msg += f"🔴 *{i}. {s['symbol']}*  `{s['change_pct']:+.2f}%`\n   ₹{s['price']}{reason_text}\n\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n👆 _Neeche stock button dabao — full detail milegi!_\n⚠️ _Sirf information. Investment advice nahi._"
     return msg
 
 def format_news_alert(title, summary, source) -> str:
@@ -384,8 +417,13 @@ async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         gainers, losers = get_top_movers(data)
         reasons = parse_ai_reasons(ai_analyze(gainers, losers))
+        keyboard = build_briefing_keyboard(gainers, losers)
         await wait.delete()
-        await update.message.reply_text(format_briefing(gainers, losers, reasons), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            format_briefing(gainers, losers, reasons),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
     except Exception as e:
         await wait.edit_text(f"❌ Error: {e}")
 
@@ -466,7 +504,8 @@ async def send_morning_briefing(bot: Bot):
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=format_briefing(gainers, losers, reasons),
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_briefing_keyboard(gainers, losers)
         )
     except Exception as e:
         logger.error(f"Morning briefing error: {e}")
